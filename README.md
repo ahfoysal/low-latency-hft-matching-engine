@@ -10,7 +10,10 @@ In-memory limit order book with `place/cancel/match` — target <10μs p99 singl
 
 ## MVP Status — shipped
 
-Single-threaded limit order book with price-time priority, matching on placement, and cancel. Bid/ask sides are `std::map<Price, std::deque<Order>>` (lock-free queues come in M2). Lives under [`mvp/`](./mvp).
+Single-threaded limit order book with price-time priority, matching on placement, and cancel. Lives under [`mvp/`](./mvp).
+
+- **M1:** bid/ask sides are `std::map<Price, std::deque<Order>>`.
+- **M2:** each price level is an intrusive doubly-linked list of `OrderNode`s drawn from a preallocated `ObjectPool` — zero heap allocations on the hot path. Cancel drops from O(level) to O(1). Adds an SPSC ring ([`mvp/src/spsc_ring.h`](./mvp/src/spsc_ring.h)) for lock-free producer→matcher hand-off (wired into the sequencer in a later milestone).
 
 ### Build
 
@@ -35,23 +38,25 @@ cmake --build build -j
 
 1,000,000 `place_limit` calls, mixed buy/sell, prices uniform in [9990, 10010] so ~half cross:
 
-| metric      | value            |
-|-------------|------------------|
-| throughput  | 5,599,824 ops/s  |
-| latency p50 | 84 ns            |
-| latency p90 | 250 ns           |
-| latency p99 | 500 ns           |
-| latency p99.9 | 1458 ns        |
-| latency max | 1.80 ms (alloc / page fault spike) |
+| metric        | M1 (deque + heap)             | M2 (intrusive + pool)       | Δ             |
+|---------------|-------------------------------|-----------------------------|---------------|
+| throughput    | 5,599,824 ops/s               | 8,158,440 ops/s             | **+46%**      |
+| latency p50   | 84 ns                         | 83 ns                       | flat          |
+| latency p90   | 250 ns                        | 125 ns                      | **−2x**       |
+| latency p99   | 500 ns                        | 250 ns                      | **−2x**       |
+| latency p99.9 | 1458 ns                       | ~1200 ns                    | **−18%**      |
+| latency max   | 1.80 ms (heap / page fault)   | ~75–100 μs                  | **~20× lower**|
 
-p99 well under the 10μs MVP goal. Max-tail spikes are expected from `std::map` node allocation; M2 (arena + intrusive lists + lock-free ring) should flatten the tail.
+The big win is the max: killing the per-order `std::deque<Order>` heap allocation flattens the worst-case tail by roughly an order of magnitude. Residual tail on macOS comes from the OS scheduler + `chrono::steady_clock` (~40ns/syscall), not the engine; Linux with `isolcpus` + `HUGETLB` + `rdtsc` timing (M5) should close the remaining gap toward the sub-μs max target.
 
 ## Milestones
-- **M1 (Week 1):** Order book (price-time priority) + matching + unit tests ✅ **MVP complete**
-- **M2 (Week 3):** Lock-free SPSC/MPSC queues + Disruptor pattern
+- **M1 (Week 1):** Order book (price-time priority) + matching + unit tests ✅ **complete**
+- **M2 (Week 3):** Intrusive doubly-linked list per level + `ObjectPool<OrderNode>` + lock-free SPSC ring (producer → matcher) ✅ **complete**
+- **M3 (Week 5):** MPSC Disruptor pattern, multi-symbol sharding
 - **M3 (Week 6):** FIX gateway + market data feed handler
-- **M4 (Week 10):** Backtester + strategy framework + replay tick data
-- **M5 (Week 16):** io_uring/DPDK + sub-microsecond tail latency
+- **M4 (Week 8):** FIX gateway + market data feed handler
+- **M5 (Week 12):** Backtester + strategy framework + replay tick data
+- **M6 (Week 16):** io_uring/DPDK + sub-microsecond tail latency (Linux isolcpus + HUGETLB)
 
 ## Key References
 - "Trading and Exchanges" (Harris)
