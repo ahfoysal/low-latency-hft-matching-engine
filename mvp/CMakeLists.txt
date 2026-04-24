@@ -20,6 +20,9 @@ add_library(order_book
   src/engine.cpp
 )
 target_include_directories(order_book PUBLIC src)
+find_package(Threads REQUIRED)
+# M5: hft::core::pin_thread_to_cpu needs pthread on Linux and Mach on macOS.
+target_link_libraries(order_book PUBLIC Threads::Threads)
 
 # M3: FIX gateway + UDP market data feed. Pulled into its own lib so the
 # bench target stays lean (no sockets, no threads).
@@ -29,9 +32,21 @@ add_library(fix_gateway
   src/md/feed.cpp
 )
 target_include_directories(fix_gateway PUBLIC src)
-target_link_libraries(fix_gateway PUBLIC order_book)
-find_package(Threads REQUIRED)
-target_link_libraries(fix_gateway PUBLIC Threads::Threads)
+target_link_libraries(fix_gateway PUBLIC order_book Threads::Threads)
+
+# M5: io_uring gateway. Linux-only native path; POSIX fallback compiles
+# everywhere so macOS / CI stay green. Toggle real path with -DHFT_IOURING=ON.
+option(HFT_IOURING "Enable liburing-backed FIX gateway (Linux only)" OFF)
+add_library(uring_gateway src/iouring/uring_gateway.cpp)
+target_include_directories(uring_gateway PUBLIC src)
+target_link_libraries(uring_gateway PUBLIC order_book fix_gateway)
+if(HFT_IOURING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_compile_definitions(uring_gateway PUBLIC HFT_IOURING)
+  target_link_libraries(uring_gateway PUBLIC uring)
+  message(STATUS "M5: io_uring path ENABLED (liburing)")
+else()
+  message(STATUS "M5: io_uring path disabled (POSIX fallback in use)")
+endif()
 
 add_executable(bench bench/bench.cpp)
 target_link_libraries(bench PRIVATE order_book)

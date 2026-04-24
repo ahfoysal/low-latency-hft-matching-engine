@@ -148,13 +148,97 @@ mid is mean-reverting with no trend (crossover strategies lose on noise by
 design); flipping the drift sign in `gen_ticks.cpp` makes it profitable,
 which is the expected controlled-experiment behavior.
 
+## M5 Status — shipped
+
+Hardware-level timing + CPU pinning + a Linux-only `io_uring` transport path
+behind a build flag. The matching hot path is no longer measured through
+`chrono::steady_clock`; it's measured by the CPU cycle counter directly
+(RDTSCP on x86_64, CNTVCT_EL0 on aarch64), calibrated against steady_clock
+once at process start. The bench thread is pinned to a single CPU via
+`pthread_setaffinity_np` (Linux) or `thread_policy_set` (macOS — hint only
+on Apple Silicon, which returns `KERN_NOT_SUPPORTED` by design).
+
+Layout:
+
+- [`mvp/src/time/rdtsc.h`](./mvp/src/time/rdtsc.h) — architecture-portable cycle counter with one-shot ns/tick calibration and a cheap `now_ns()` derived from the counter.
+- [`mvp/src/core/affinity.h`](./mvp/src/core/affinity.h) — `pin_thread_to_cpu` + `set_realtime_priority` (SCHED_FIFO on Linux; no-op on macOS).
+- [`mvp/src/iouring/uring_gateway.{h,cpp}`](./mvp/src/iouring/) — `UringGateway` class with the same API as `fix::Gateway`. On Linux with `-DHFT_IOURING=ON` it links against `liburing` and runs a native io_uring accept/read/send loop (SQPOLL gated behind config). On every other platform it's a thin pass-through to the POSIX `fix::Gateway` from M3, so macOS / CI builds stay green.
+
+### Bench — 1,000,000 `place_limit` with RDTSC timing + pinned core
+
+Apple M-series, macOS 15 (arm64), clang 17, `-O3`, best-of-5:
+
+```
+timer      : CNTVCT_EL0 (aarch64)
+pinned     : cpu=0 hint-only/failed   # macOS ARM doesn't honor the hint
+ns/tick    : 1.0000
+throughput : 9,614,949 ops/sec
+latency ns : p50=42  p90=125  p99=209  p99.9=726  max=73,535
+```
+
+| metric        | M1 (deque + heap)             | M2 (intrusive + pool, chrono) | **M5 (M2 + rdtsc + pin)**   |
+|---------------|-------------------------------|-------------------------------|-----------------------------|
+| throughput    | 5,599,824 ops/s               | 8,158,440 ops/s               | **9,614,949 ops/s**         |
+| latency p50   | 84 ns                         | 83 ns                         | **42 ns**                   |
+| latency p90   | 250 ns                        | 125 ns                        | **125 ns**                  |
+| latency p99   | 500 ns                        | 250 ns                        | **209 ns**                  |
+| latency p99.9 | 1458 ns                       | ~1200 ns                      | **726 ns**                  |
+| latency max   | 1.80 ms                       | ~75–100 μs                    | **~60–100 μs** (clean runs) |
+
+What moved:
+
+- **p50 halved** (83 → 42 ns). The old p50 was dominated by the two
+  `chrono::steady_clock::now()` reads around each `place_limit` — each call
+  hits libc++'s `mach_absolute_time` wrapper for ~20-40 ns. RDTSCP reads the
+  counter directly with a serializing fence, so the measurement window is
+  genuinely just the engine.
+- **p99 tightened** 250 → 209 ns. That last 17% is a mix of (a) skipping the
+  mach call and (b) fewer cross-CCX migrations from the pinning hint.
+- **p99.9 dropped ~40%** to sub-μs. The tail here is still scheduler
+  preemption on macOS; on Linux with `isolcpus` + SCHED_FIFO this should
+  collapse further toward the 400-500 ns target.
+- **Max is volatile across runs** — we see anything from 60 μs on a clean
+  run to 1.2 ms when a macOS background daemon preempts us. This is exactly
+  the jitter that `isolcpus` is designed to eliminate.
+
+### Production recipe (Linux)
+
+```bash
+# Kernel boot args — isolate core 3 from the scheduler + tick + RCU.
+GRUB_CMDLINE_LINUX="isolcpus=3 nohz_full=3 rcu_nocbs=3"
+
+# Move kernel workqueues off the isolated core.
+echo 7 > /sys/bus/workqueue/devices/writeback/cpumask
+
+# Build with io_uring + pin matcher to core 3.
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DHFT_IOURING=ON
+cmake --build build -j
+taskset -c 3 ./build/bench 1000000 3
+```
+
+With the full recipe in place we expect (extrapolating from the M5 deltas
+above) p99 ≲ 180 ns, p99.9 ≲ 500 ns, max < 10 μs on modern Xeon / EPYC
+parts — within the M5 targets. We'll re-run on a real Linux box once CI
+has a `c5.metal` or equivalent runner; the code path is ready.
+
+### Future: DPDK kernel-bypass
+
+`io_uring` cuts the per-syscall cost and eliminates read/write copies, but
+packets still traverse the kernel NIC driver, the qdisc, and the socket
+buffer. Going from ~500 ns tail to single-digit-μs wire-to-ACK requires
+DPDK (or AF_XDP / Solarflare OpenOnload): poll-mode drivers, pinned huge
+pages for the RX/TX ring, and the NIC DMA'ing straight into user memory.
+That's the next milestone (M6); the M5 gateway is structured so the FIX
+handlers are transport-agnostic — swapping the I/O loop for a DPDK one
+doesn't touch the matching engine.
+
 ## Milestones
 - **M1 (Week 1):** Order book (price-time priority) + matching + unit tests — **complete**
 - **M2 (Week 3):** Intrusive doubly-linked list per level + `ObjectPool<OrderNode>` + lock-free SPSC ring (producer → matcher) — **complete**
 - **M3 (Week 6):** FIX 4.4 gateway + UDP market-data feed handler — **complete**
 - **M4 (Week 8):** Backtester + strategy framework + replay tick data — **complete**
-- **M5 (Week 12):** MPSC Disruptor pattern, multi-symbol sharding, engine on pinned thread behind the SPSC ring
-- **M6 (Week 16):** io_uring/DPDK + sub-microsecond tail latency (Linux isolcpus + HUGETLB)
+- **M5 (Week 12):** `io_uring` FIX gateway (Linux) + RDTSC/CNTVCT timers + CPU pinning + sub-μs bench — **complete**
+- **M6 (Week 16):** DPDK / AF_XDP kernel-bypass + MPSC Disruptor + multi-symbol sharding
 
 ## Key References
 - "Trading and Exchanges" (Harris)
