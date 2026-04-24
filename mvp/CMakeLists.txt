@@ -44,3 +44,25 @@ add_test(NAME order_book_tests COMMAND test_book)
 add_executable(test_fix test/test_fix.cpp)
 target_link_libraries(test_fix PRIVATE fix_gateway)
 add_test(NAME fix_tests COMMAND test_fix)
+
+# M4: backtester + strategy framework. Pulled into its own lib so bench + test
+# + main driver all share the same object files.
+add_library(backtest
+  src/backtest/portfolio.cpp
+  src/backtest/strategy.cpp
+  src/backtest/replay.cpp
+  strategies/mm.cpp
+  strategies/ma_cross.cpp
+)
+target_include_directories(backtest PUBLIC src . strategies)
+target_link_libraries(backtest PUBLIC order_book)
+
+add_executable(gen_ticks bench/gen_ticks.cpp)
+target_link_libraries(gen_ticks PRIVATE backtest)
+
+add_executable(backtest_main bench/backtest_main.cpp)
+target_link_libraries(backtest_main PRIVATE backtest)
+
+add_executable(test_backtest test/test_backtest.cpp)
+target_link_libraries(test_backtest PRIVATE backtest)
+add_test(NAME backtest_tests COMMAND test_backtest)

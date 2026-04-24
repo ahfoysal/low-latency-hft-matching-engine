@@ -97,12 +97,63 @@ all 4 tests passed
 
 15 ms for 1000 orders round-tripped through TCP + FIX encode/decode + engine + UDP fan-out = ~67k ord/s single-session on loopback. This is not the engine's ceiling (M2 bench is 8M ord/s in-process) — it's the gateway / socket layer, which M4 will optimize (batched `send`, pinned threads, eventually io_uring).
 
+## M4 Status — shipped
+
+Backtester + strategy framework. A replay engine reads timestamped L2-ish
+tick events (Add/Cancel/Trade) from CSV (or a compact binary dump), feeds
+them into the same `Engine` used in production, and fans out per-tick
+callbacks to a list of `Strategy` subclasses. Each strategy has its own
+`Portfolio` (weighted-avg-cost position + realized/unrealized PnL). The
+replayer routes engine-side `Trade`s back to the originating strategy via
+an `OrderId → Strategy*` table, so fills against exogenous makers do not
+contaminate strategy PnL.
+
+Layout:
+
+- [`mvp/src/backtest/replay.{h,cpp}`](./mvp/src/backtest/) — Tick + CSV/binary IO + Replay loop (Max / Realtime speeds).
+- [`mvp/src/backtest/strategy.{h,cpp}`](./mvp/src/backtest/) — `Strategy` base + `StrategyContext` (place/cancel routed to owner).
+- [`mvp/src/backtest/portfolio.{h,cpp}`](./mvp/src/backtest/) — WAC PnL accounting, including sign-flip closures.
+- [`mvp/strategies/mm.{h,cpp}`](./mvp/strategies/) — Symmetric market maker with inventory skew.
+- [`mvp/strategies/ma_cross.{h,cpp}`](./mvp/strategies/) — Fast/slow SMA crossover, flips to ±target_position.
+- [`mvp/bench/gen_ticks.cpp`](./mvp/bench/gen_ticks.cpp) — Synthetic generator: ~70% Adds, ~20% trade prints, ~10% cancels, mean-reverting mid.
+- [`mvp/bench/backtest_main.cpp`](./mvp/bench/backtest_main.cpp) — Loads a tick file, runs replay, prints per-strategy stats.
+- [`mvp/test/test_backtest.cpp`](./mvp/test/test_backtest.cpp) — 22 unit tests: portfolio math, CSV roundtrip, replay routing.
+
+### Demo
+
+```bash
+cd mvp
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+./build/test_backtest
+./build/gen_ticks /tmp/ticks.csv 100000 42
+./build/backtest_main /tmp/ticks.csv
+```
+
+Sample run on 100k synthetic ticks (Apple M-series, macOS):
+
+```
+--- replay stats ---
+  ticks=100400 adds=70445 cancels=9821 trades=20134 engine_trades=30842
+  wall=146ms  (0.69M ticks/s)
+
+--- per-strategy stats (mark=9999) ---
+  market_maker   | submitted=3927  filled=20    canceled=3912 | pos=-53 avg=9999 | realized=+15    total=+15
+  ma_cross       | submitted=776   filled=3709  canceled=0    | pos=-20 avg=9999 | realized=-20929 total=-20929
+```
+
+The MM holds small inventory near zero and scratches a tiny positive PnL —
+exactly the shape you want for a symmetric quoter on a mean-reverting
+instrument. The MA crossover bleeds on this series because the synthetic
+mid is mean-reverting with no trend (crossover strategies lose on noise by
+design); flipping the drift sign in `gen_ticks.cpp` makes it profitable,
+which is the expected controlled-experiment behavior.
+
 ## Milestones
 - **M1 (Week 1):** Order book (price-time priority) + matching + unit tests — **complete**
 - **M2 (Week 3):** Intrusive doubly-linked list per level + `ObjectPool<OrderNode>` + lock-free SPSC ring (producer → matcher) — **complete**
 - **M3 (Week 6):** FIX 4.4 gateway + UDP market-data feed handler — **complete**
-- **M4 (Week 8):** MPSC Disruptor pattern, multi-symbol sharding, engine on pinned thread behind the SPSC ring
-- **M5 (Week 12):** Backtester + strategy framework + replay tick data
+- **M4 (Week 8):** Backtester + strategy framework + replay tick data — **complete**
+- **M5 (Week 12):** MPSC Disruptor pattern, multi-symbol sharding, engine on pinned thread behind the SPSC ring
 - **M6 (Week 16):** io_uring/DPDK + sub-microsecond tail latency (Linux isolcpus + HUGETLB)
 
 ## Key References
