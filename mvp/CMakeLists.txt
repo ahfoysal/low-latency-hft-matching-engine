@@ -81,3 +81,45 @@ target_link_libraries(backtest_main PRIVATE backtest)
 add_executable(test_backtest test/test_backtest.cpp)
 target_link_libraries(test_backtest PRIVATE backtest)
 add_test(NAME backtest_tests COMMAND test_backtest)
+
+# M6: PTP client + DPDK scaffold + FPGA stub + kernel-driver trait.
+option(HFT_DPDK "Enable librte_eal-backed DPDK driver (Linux only)" OFF)
+option(HFT_FPGA "Enable sample FPGA driver (requires /dev node)"    OFF)
+option(HFT_PTP  "Enable Linux PHC /dev/ptp0 PTP backend"            OFF)
+
+add_library(m6_runtime
+  src/core/software_driver.cpp
+  src/dpdk/dpdk_driver.cpp
+  src/fpga/fpga_driver.cpp
+  src/ptp/ptp_client.cpp
+)
+target_include_directories(m6_runtime PUBLIC src)
+target_link_libraries(m6_runtime PUBLIC order_book fix_gateway uring_gateway Threads::Threads)
+
+if(HFT_DPDK AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_compile_definitions(m6_runtime PUBLIC HFT_DPDK)
+  target_link_libraries(m6_runtime PUBLIC rte_eal rte_ethdev rte_mbuf rte_mempool)
+  message(STATUS "M6: DPDK driver ENABLED (librte_eal)")
+else()
+  message(STATUS "M6: DPDK driver disabled (stub in use)")
+endif()
+
+if(HFT_FPGA)
+  target_compile_definitions(m6_runtime PUBLIC HFT_FPGA)
+  message(STATUS "M6: FPGA driver ENABLED (mmio path)")
+else()
+  message(STATUS "M6: FPGA driver disabled (stub in use)")
+endif()
+
+if(HFT_PTP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_compile_definitions(m6_runtime PUBLIC HFT_PTP)
+  message(STATUS "M6: PTP Linux PHC backend ENABLED")
+else()
+  message(STATUS "M6: PTP using mock-oracle backend (Linux PHC disabled)")
+endif()
+
+add_executable(ptp_oracle src/ptp/ptp_oracle.cpp)
+
+add_executable(test_m6 test/test_m6.cpp)
+target_link_libraries(test_m6 PRIVATE m6_runtime)
+add_test(NAME m6_tests COMMAND test_m6)

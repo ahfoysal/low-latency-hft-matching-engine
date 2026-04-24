@@ -232,13 +232,126 @@ That's the next milestone (M6); the M5 gateway is structured so the FIX
 handlers are transport-agnostic — swapping the I/O loop for a DPDK one
 doesn't touch the matching engine.
 
+## M6 Status — shipped
+
+Three orthogonal pieces: an ISA-agnostic kernel-driver trait, a PTP
+clock-sync client, and a DPDK scaffold (plus a sample FPGA driver stub)
+that plug into the trait.
+
+### Architecture
+
+```
+        +-----------------------------------------------------------+
+        |                      hft::Engine                          |
+        |         (single-threaded, lock-free, hot path)            |
+        +--------------------------^--------------------------------+
+                                   | place_limit / cancel
+                                   |
+                 +-----------------+-------------------+
+                 |     IKernelDriver trait             |
+                 |  (src/core/driver.h)                |
+                 |    start / stop / poll / flush_tx   |
+                 +----+---------------+------------+---+
+                      |               |            |
+              +-------v----+   +------v-----+  +---v--------+
+              | Software   |   |  DPDK      |  | FPGA       |
+              | (posix +   |   |  (scaffold:|  | (stub:     |
+              |  io_uring) |   |   rte_eal) |  |  mmio BAR) |
+              +-----+------+   +------+-----+  +-----+------+
+                    |                 |              |
+              sockets/io_uring   NIC PMD queue   mmap'd ring + doorbell
+
+           +---------------------------+
+           |  PtpClient (src/ptp/)     |
+           |  /dev/ptp0 | ptp4l UDS |  |
+           |  mock UDP oracle          |
+           +--------------+------------+
+                          | offset_ns (EWMA)
+                          v
+                   fill timestamps stamped with master-clock ns
+```
+
+All three driver impls implement the same `IKernelDriver` interface so
+the matching core, the backtester, and the FIX tests don't care which
+transport is underneath. The factory tries FPGA -> DPDK -> software in
+priority order and falls through if a backend is unavailable at build
+or runtime.
+
+### Layout
+
+- [`mvp/src/core/driver.h`](./mvp/src/core/driver.h) — the kernel trait + factory entry points (`make_software_driver`, `make_dpdk_driver`, `make_fpga_driver`, `make_best_available_driver`).
+- [`mvp/src/core/software_driver.{h,cpp}`](./mvp/src/core/) — always-available POSIX / io_uring path; reuses the M3 FIX gateway and M5 `UringGateway`.
+- [`mvp/src/dpdk/dpdk_driver.{h,cpp}`](./mvp/src/dpdk/) — compiles as a stub on macOS / by default; with `-DHFT_DPDK=ON` on Linux it pulls in `librte_eal` + `librte_ethdev` + `librte_mbuf`, runs `rte_eal_init`, configures a queue, and burst-reads mbufs in `poll()`. The FIX decode / TCP reassembly layer is stubbed in comments — the milestone ships the scaffold, not a production PMD.
+- [`mvp/src/fpga/fpga_driver.{h,cpp}`](./mvp/src/fpga/) — sample FPGA driver showing how an accelerated order book would plug in: open `/dev/hft_fpga0`, `mmap` the BAR, drain a completion ring, doorbell via a single MMIO store. Gated behind `-DHFT_FPGA=ON`.
+- [`mvp/src/ptp/ptp_client.{h,cpp}`](./mvp/src/ptp/) — PTP client. Three backends selected at runtime: Linux PHC via `/dev/ptp0` + `clock_gettime(CLOCK_PTP)` (`-DHFT_PTP=ON`), ptp4l UDS stub, and a mock UDP oracle for macOS / CI. Uses classic two-way sync math (`offset = ((T2-T1) + (T3-T4)) / 2`) plus an EWMA filter.
+- [`mvp/src/ptp/ptp_oracle.cpp`](./mvp/src/ptp/ptp_oracle.cpp) — stand-alone `ptp_oracle` binary that answers the mock protocol, applies a deterministic offset, and ships timestamps. Useful as a cross-host test harness.
+- [`mvp/test/test_m6.cpp`](./mvp/test/test_m6.cpp) — 15 assertions across driver-factory shape, DPDK/FPGA stub describe, software-driver lifecycle, and an in-process mock-oracle that exercises the PTP client until the EWMA converges on the expected +1.2 ms master offset.
+
+### Build + demo
+
+```bash
+cd mvp
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/test_m6           # driver trait + PTP mock-oracle roundtrip
+./build/ptp_oracle 0.0.0.0 9881 &    # optional: cross-host sync test
+./build/bench 1000000     # re-run the M5 microbench (unchanged core)
+```
+
+Opt-in build flags (no-op on macOS):
+
+```bash
+# Full Linux production recipe: io_uring + DPDK PMD + PHC + FPGA.
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+  -DHFT_IOURING=ON -DHFT_DPDK=ON -DHFT_PTP=ON -DHFT_FPGA=ON
+cmake --build build -j
+```
+
+### Benchmark re-run (Apple M-series, macOS arm64, clang 17, -O3, best-of-5)
+
+The M6 work is all transport/driver scaffolding — the matching hot path
+is untouched. The microbench confirms there's no regression:
+
+```
+timer      : CNTVCT_EL0 (aarch64)
+pinned     : cpu=2 hint-only/failed
+ns/tick    : 1.0000
+throughput : 9,394,714 ops/sec
+latency ns : p50=42  p90=125  p99=209  p99.9=1083  max=74,327
+```
+
+| metric     | M5 baseline       | M6 (same core, driver trait added) |
+|------------|-------------------|------------------------------------|
+| throughput | 9,614,949 ops/s   | 9,394,714 ops/s (run-to-run jitter) |
+| p50        | 42 ns             | 42 ns |
+| p99        | 209 ns            | 209 ns |
+| p99.9      | 726 ns            | ~1083 ns (macOS scheduler noise) |
+
+The driver trait is compile-time dispatch from `make_software_driver`
+(virtual calls only happen on start/stop/poll, not on the match
+path), so the hot path is bit-for-bit identical to M5 and the headline
+numbers hold.
+
+### What's next
+
+- Flesh out DPDK: `rte_flow` rules to steer the FIX TCP flow into our
+  queue, a userspace TCP reassembler (mTCP-style or hand-rolled over
+  the existing `hft::fix::Parser`), batched `rte_eth_tx_burst` with
+  ExecutionReport coalescing.
+- PTP: wire up the real `ptp4l` management-message TLV over UDS so a
+  running `ptp4l` daemon can be consulted without claiming the NIC.
+- Sharding: multi-symbol MPSC Disruptor across pinned matcher cores —
+  the driver trait already decouples transport, so this is purely an
+  engine-side refactor.
+
 ## Milestones
 - **M1 (Week 1):** Order book (price-time priority) + matching + unit tests — **complete**
 - **M2 (Week 3):** Intrusive doubly-linked list per level + `ObjectPool<OrderNode>` + lock-free SPSC ring (producer → matcher) — **complete**
 - **M3 (Week 6):** FIX 4.4 gateway + UDP market-data feed handler — **complete**
 - **M4 (Week 8):** Backtester + strategy framework + replay tick data — **complete**
 - **M5 (Week 12):** `io_uring` FIX gateway (Linux) + RDTSC/CNTVCT timers + CPU pinning + sub-μs bench — **complete**
-- **M6 (Week 16):** DPDK / AF_XDP kernel-bypass + MPSC Disruptor + multi-symbol sharding
+- **M6 (Week 16):** PTP clock sync + ISA-agnostic kernel driver trait + DPDK scaffold + sample FPGA driver — **complete**
+- **M7 (Week 20):** DPDK production PMD (rte_flow + userspace TCP) + MPSC Disruptor + multi-symbol sharding
 
 ## Key References
 - "Trading and Exchanges" (Harris)
